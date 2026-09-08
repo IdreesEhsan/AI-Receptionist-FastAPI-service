@@ -95,6 +95,13 @@ async def check_availability(request: Request):
         return JSONResponse(status_code=400, content={"message": "Not a tool-calls request"})
 
     date_filter = args.get("date")
+    
+    # FIX: If the year is 2024, auto-correct to the current year
+    if date_filter and date_filter.startswith("2024-"):
+        import datetime as dt
+        current_year = dt.datetime.now().year
+        date_filter = date_filter.replace("2024", str(current_year))
+        print(f"YEAR CORRECTED: {date_filter}")
 
     query = supabase.table("availability").select("*").eq("is_booked", False)
     if date_filter:
@@ -103,12 +110,20 @@ async def check_availability(request: Request):
         except ValueError:
             return tool_result(call_id, "I didn't understand that date. Please ask the caller to repeat it clearly.")
 
+        # Convert to UTC for the query
         day_start_local = datetime.combine(local_date, time.min, tzinfo=BUSINESS_TZ)
         day_end_local = datetime.combine(local_date, time.max, tzinfo=BUSINESS_TZ)
-        query = query.gte("slot_start", day_start_local.isoformat()).lte("slot_start", day_end_local.isoformat())
+        
+        # Convert to UTC strings
+        day_start_utc = day_start_local.astimezone(ZoneInfo("UTC")).isoformat()
+        day_end_utc = day_end_local.astimezone(ZoneInfo("UTC")).isoformat()
+        
+        query = query.gte("slot_start", day_start_utc).lte("slot_start", day_end_utc)
 
     result = query.order("slot_start").limit(3).execute()
     slots = result.data
+    
+    print(f"SLOTS FOUND: {len(slots)}")
 
     if not slots:
         return tool_result(call_id, "No available slots found for that date. Ask the caller for an alternative date.")
