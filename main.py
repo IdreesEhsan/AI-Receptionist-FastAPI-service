@@ -31,6 +31,17 @@ def verify_secret(request: Request) -> bool:
     return hmac.compare_digest(received, VAPI_SERVER_SECRET)
 
 
+def log_payload(endpoint: str, body: dict):
+    """Temporary debug logging — prints the raw request body to Railway's logs
+    so you can confirm the actual shape Vapi sends for EACH tool (book_appointment
+    and escalate haven't been verified live yet, only check_availability has).
+    Tagged with the endpoint name so the three tools don't get mixed up in the
+    log stream. Remove this once all three tools are confirmed working end-to-end
+    — it logs caller PII (name/phone/email) to Railway's logs, which you don't
+    want lingering in production."""
+    print(f"RAW VAPI PAYLOAD [{endpoint}]:", body)
+
+
 def get_tool_call(body: dict):
     """Pull the arguments out of the request body.
 
@@ -98,6 +109,7 @@ async def check_availability(request: Request):
         return JSONResponse(status_code=401, content={"message": "Unauthorized"})
 
     body = await request.json()
+    log_payload("check-availability", body)
     call_id, args = get_tool_call(body)
     if call_id is None:
         return JSONResponse(status_code=400, content={"message": "Not a tool-calls request"})
@@ -142,6 +154,7 @@ async def book_appointment(request: Request):
         return JSONResponse(status_code=401, content={"message": "Unauthorized"})
 
     body = await request.json()
+    log_payload("book-appointment", body)
     call_id, args = get_tool_call(body)
     if call_id is None:
         return JSONResponse(status_code=400, content={"message": "Not a tool-calls request"})
@@ -190,6 +203,7 @@ async def escalate(request: Request):
         return JSONResponse(status_code=401, content={"message": "Unauthorized"})
 
     body = await request.json()
+    log_payload("escalate", body)
     call_id, args = get_tool_call(body)
     if call_id is None:
         return JSONResponse(status_code=400, content={"message": "Not a tool-calls request"})
