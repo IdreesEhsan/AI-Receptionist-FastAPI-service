@@ -1,52 +1,53 @@
 import os
-import json
+import hmac
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from retell import Retell
 
 from db import supabase
 
 app = FastAPI()
-retell = Retell(api_key=os.environ["RETELL_API_KEY"])
+
+VAPI_SERVER_SECRET = os.environ["VAPI_SERVER_SECRET"]
 
 # Match whatever timezone your Supabase seed data was built in.
 BUSINESS_TZ = ZoneInfo("Asia/Karachi")
 
 
-# ---------------------------------------------------------------------------
-# Shared helper: verify Retell's signature, return parsed body (or None, None)
-# ---------------------------------------------------------------------------
-async def verify_and_parse(request: Request):
-    """Verify Retell's signature against the RAW body (not re-parsed JSON —
-    re-serializing can reorder keys and break the signature check).
+def verify_secret(request: Request) -> bool:
+    """Vapi sends back whatever secret you configured on each Tool's Server URL,
+    in the X-Vapi-Secret header, on every request to that tool. This is a plain
+    shared-secret check, not a cryptographic signature like Retell's — so there's
+    no regex/library call here that can crash on a missing header the way
+    Retell's SDK did. We still check for a missing header explicitly and fail
+    closed (return False) rather than relying on that being safe by accident.
+    hmac.compare_digest is used instead of `==` for a timing-safe comparison."""
+    received = request.headers.get("X-Vapi-Secret")
+    if not received:
+        return False
+    return hmac.compare_digest(received, VAPI_SERVER_SECRET)
 
-    IMPORTANT: request.headers.get("X-Retell-Signature") returns None when the
-    header is missing entirely (e.g. a manual curl test, or any request that
-    didn't come from Retell). The Retell SDK's verify() does NOT guard against
-    this — it runs signature straight into a regex match and raises a raw
-    TypeError if signature is None, instead of returning False. That crash
-    was showing up as a 500 error on the exact "expected 401" test in the
-    deploy-verification checklist. We check for a missing header ourselves,
-    before ever calling verify(), so "no signature" and "bad signature" both
-    cleanly resolve to "unauthorized" instead of one of them crashing the app.
-    """
-    raw_body = (await request.body()).decode("utf-8")
-    signature = request.headers.get("X-Retell-Signature")
 
-    if not signature:
+def get_tool_call(body: dict):
+    """Pull the id and arguments out of Vapi's message.toolCallList[0].
+    Returns (None, None) if the payload doesn't look like a tool-calls message
+    at all — defensive, in case Vapi ever pings this URL with a different
+    event type by mistake."""
+    message = body.get("message", {})
+    if message.get("type") != "tool-calls":
         return None, None
-
-    valid = retell.verify(
-        raw_body,
-        api_key=os.environ["RETELL_API_KEY"],
-        signature=signature,
-    )
-    if not valid:
+    tool_calls = message.get("toolCallList", [])
+    if not tool_calls:
         return None, None
-    return json.loads(raw_body), raw_body
+    call = tool_calls[0]
+    args = call.get("arguments", call.get("parameters", {}))
+    return call.get("id"), args
+
+
+def tool_result(tool_call_id: str, result_text: str):
+    return {"results": [{"toolCallId": tool_call_id, "result": result_text}]}
 
 
 @app.get("/")
@@ -56,40 +57,38 @@ async def health_check():
     return {"status": "ok"}
 
 
-# ---------------------------------------------------------------------------
-# 1. Check availability
-# ---------------------------------------------------------------------------
+# ---- 1. Check availability ----
 @app.post("/check-availability")
 async def check_availability(request: Request):
-    body, _ = await verify_and_parse(request)
-    if body is None:
+    if not verify_secret(request):
         return JSONResponse(status_code=401, content={"message": "Unauthorized"})
 
-    params = body["args"]
-    date_filter = params.get("date")  # e.g. "2026-09-10", meant as a LOCAL calendar date
+    body = await request.json()
+    call_id, args = get_tool_call(body)
+    if call_id is None:
+        return JSONResponse(status_code=400, content={"message": "Not a tool-calls request"})
+
+    date_filter = args.get("date")  # e.g. "2026-09-10", meant as a LOCAL calendar date
 
     query = supabase.table("availability").select("*").eq("is_booked", False)
-
     if date_filter:
-        # Build local-day boundaries in BUSINESS_TZ, then convert to UTC for the query.
-        # A "day" in Lahore doesn't line up with a UTC day — filtering on raw date
-        # strings against UTC timestamps silently returns wrong slots near day edges.
+        # Build local-day boundaries in BUSINESS_TZ, then convert to UTC for the query —
+        # a "day" in Lahore doesn't line up with a UTC day, so filtering on raw date
+        # strings against UTC timestamps silently returns the wrong slots near day edges.
         try:
             local_date = datetime.strptime(date_filter, "%Y-%m-%d").date()
         except ValueError:
-            return {"result": "I didn't understand that date. Please ask the caller to repeat it clearly."}
+            return tool_result(call_id, "I didn't understand that date. Please ask the caller to repeat it clearly.")
 
         day_start_local = datetime.combine(local_date, time.min, tzinfo=BUSINESS_TZ)
         day_end_local = datetime.combine(local_date, time.max, tzinfo=BUSINESS_TZ)
-        query = query.gte("slot_start", day_start_local.isoformat()).lte(
-            "slot_start", day_end_local.isoformat()
-        )
+        query = query.gte("slot_start", day_start_local.isoformat()).lte("slot_start", day_end_local.isoformat())
 
     result = query.order("slot_start").limit(3).execute()
     slots = result.data
 
     if not slots:
-        return {"result": "No available slots found for that date. Ask the caller for an alternative date."}
+        return tool_result(call_id, "No available slots found for that date. Ask the caller for an alternative date.")
 
     # Convert stored UTC timestamps back to local time and format as something speakable.
     readable = []
@@ -99,78 +98,75 @@ async def check_availability(request: Request):
         # %-I drops the leading zero on the hour; Linux/Mac only (fine on Render/Railway).
         readable.append(local_dt.strftime("%A, %B %d at %-I:%M %p"))
 
-    return {
-        "result": f"Available slots: {'; '.join(readable)}",
-        "slot_ids": [s["id"] for s in slots],
-    }
+    return tool_result(call_id, f"Available slots: {'; '.join(readable)}")
 
 
-# ---------------------------------------------------------------------------
-# 2. Book appointment (atomic claim — race-condition safe)
-# ---------------------------------------------------------------------------
+# ---- 2. Book appointment (atomic, race-condition safe) ----
 @app.post("/book-appointment")
 async def book_appointment(request: Request):
-    body, _ = await verify_and_parse(request)
-    if body is None:
+    if not verify_secret(request):
         return JSONResponse(status_code=401, content={"message": "Unauthorized"})
 
-    params = body["args"]
-    call_id = body["call"]["call_id"]
+    body = await request.json()
+    call_id, args = get_tool_call(body)
+    if call_id is None:
+        return JSONResponse(status_code=400, content={"message": "Not a tool-calls request"})
 
-    slot_id = params.get("slot_id")
-    full_name = params.get("full_name")
-    phone = params.get("phone")
-    email = params.get("email")
+    vapi_call_id = body["message"]["call"]["id"]  # the actual phone call, not the tool-call id
+
+    slot_id = args.get("slot_id")
+    full_name = args.get("full_name")
+    phone = args.get("phone")
+    email = args.get("email")
 
     if not slot_id or not full_name or not phone:
-        return {"result": "Missing required booking details. Ask the caller to repeat their name and phone number."}
+        return tool_result(call_id, "Missing required booking details. Ask the caller to repeat their name and phone number.")
 
-    # Atomic claim: only succeeds if the slot is still unbooked. Prevents double-booking
-    # even if two calls race for the same slot, or Retell retries this request.
-    claim = (
-        supabase.table("availability")
-        .update({"is_booked": True})
-        .eq("id", slot_id)
-        .eq("is_booked", False)
+    # Atomic claim — prevents double-booking, safe even if Vapi retries this call
+    claim = supabase.table("availability") \
+        .update({"is_booked": True}) \
+        .eq("id", slot_id).eq("is_booked", False) \
         .execute()
-    )
 
     if not claim.data:
-        return {"result": "That slot was just taken. Please offer the caller alternative times."}
+        return tool_result(call_id, "That slot was just taken. Please offer the caller alternative times.")
 
-    # Upsert contact by phone
     existing = supabase.table("contacts").select("id").eq("phone", phone).execute()
     if existing.data:
         contact_id = existing.data[0]["id"]
     else:
-        new_contact = (
-            supabase.table("contacts")
-            .insert({"full_name": full_name, "phone": phone, "email": email})
-            .execute()
-        )
+        new_contact = supabase.table("contacts").insert({
+            "full_name": full_name, "phone": phone, "email": email
+        }).execute()
         contact_id = new_contact.data[0]["id"]
 
-    supabase.table("bookings").insert(
-        {"contact_id": contact_id, "slot_id": slot_id, "call_id": call_id}
-    ).execute()
+    supabase.table("bookings").insert({
+        "contact_id": contact_id,
+        "slot_id": slot_id,
+        "call_id": vapi_call_id
+    }).execute()
 
-    return {"result": f"Booking confirmed for {full_name}."}
+    return tool_result(call_id, f"Booking confirmed for {full_name}.")
 
 
-# ---------------------------------------------------------------------------
-# 3. Escalation logging
-# ---------------------------------------------------------------------------
+# ---- 3. Escalation logging ----
 @app.post("/escalate")
 async def escalate(request: Request):
-    body, _ = await verify_and_parse(request)
-    if body is None:
+    if not verify_secret(request):
         return JSONResponse(status_code=401, content={"message": "Unauthorized"})
 
-    call_id = body["call"]["call_id"]
-    reason = body["args"].get("reason", "unspecified")
+    body = await request.json()
+    call_id, args = get_tool_call(body)
+    if call_id is None:
+        return JSONResponse(status_code=400, content={"message": "Not a tool-calls request"})
 
-    supabase.table("call_logs").upsert(
-        {"call_id": call_id, "outcome": "escalated", "escalation_reason": reason}
-    ).execute()
+    vapi_call_id = body["message"]["call"]["id"]
+    reason = args.get("reason", "unspecified")
 
-    return {"result": "Escalation logged. Offer the caller a callback."}
+    supabase.table("call_logs").upsert({
+        "call_id": vapi_call_id,
+        "outcome": "escalated",
+        "escalation_reason": reason
+    }).execute()
+
+    return tool_result(call_id, "Escalation logged. Offer the caller a callback.")
