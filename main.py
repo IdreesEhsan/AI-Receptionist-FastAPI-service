@@ -28,15 +28,21 @@ def log_payload(endpoint: str, body: dict):
 
 
 def get_tool_call(body: dict):
-    """Extract tool call ID and arguments from either enveloped or flat payload."""
+    """
+    Extract tool call ID and arguments from either:
+    - Enveloped shape: { "message": { "type": "tool-calls", "toolCalls": [...] } }
+    - Flat shape: { "date": "2026-09-10", ... }
+    """
     message = body.get("message")
     if isinstance(message, dict) and message.get("type") == "tool-calls":
-        tool_calls = message.get("toolCallList", [])
+        # FIX: Changed from "toolCallList" to "toolCalls" to match actual Vapi payload
+        tool_calls = message.get("toolCalls", [])
         if not tool_calls:
             return None, None
         call = tool_calls[0]
         raw_args = call.get("arguments", call.get("parameters", {}))
-        # BUG FIX: arguments is often a JSON string, not a dict
+
+        # Vapi often sends arguments as a JSON string, not a dict
         if isinstance(raw_args, str):
             try:
                 args = json.loads(raw_args)
@@ -44,8 +50,10 @@ def get_tool_call(body: dict):
                 args = {}
         else:
             args = raw_args if isinstance(raw_args, dict) else {}
+
         return call.get("id"), args
 
+    # Fallback: flat shape (the body itself IS the arguments)
     if isinstance(body, dict):
         return "flat", body
 
@@ -102,8 +110,6 @@ async def check_availability(request: Request):
     if not slots:
         return tool_result(call_id, "No available slots found for that date. Ask the caller for an alternative date.")
 
-    # BUG FIX: Return both slot_id (UUID) and readable label
-    # The model MUST use slot_id for booking, not the label
     slot_list = []
     for s in slots:
         utc_dt = datetime.fromisoformat(s["slot_start"])
@@ -113,7 +119,7 @@ async def check_availability(request: Request):
 
     result_text = "Available slots:\n" + "\n".join(slot_list)
     result_text += "\n\nIMPORTANT: When booking, use the exact ID value (not the time string) as slot_id."
-    
+
     return tool_result(call_id, result_text)
 
 
@@ -131,21 +137,22 @@ async def book_appointment(request: Request):
 
     vapi_call_id = get_call_id(body)
 
-    slot_id = args.get("slot_id")
-    full_name = args.get("full_name")
-    phone = args.get("phone")
-    email = args.get("email")
+    # Strip whitespace to handle LLM copy-paste errors
+    slot_id = str(args.get("slot_id", "")).strip()
+    full_name = str(args.get("full_name", "")).strip()
+    phone = str(args.get("phone", "")).strip()
+    email = str(args.get("email", "")).strip()
 
     if not slot_id or not full_name or not phone:
         return tool_result(call_id, "Missing required booking details. Ask the caller to repeat their name and phone number.")
 
     # Validate slot_id looks like a UUID (basic sanity check)
     try:
-        uuid.UUID(str(slot_id))
+        uuid.UUID(slot_id)
     except ValueError:
         return tool_result(call_id, "Invalid slot ID format. Please try booking again with the correct slot ID from the available times.")
 
-    # Atomic claim — prevents double-booking, safe even if Vapi retries this call
+    # Atomic claim — prevents double-booking
     claim = supabase.table("availability") \
         .update({"is_booked": True}) \
         .eq("id", slot_id).eq("is_booked", False) \
@@ -154,6 +161,7 @@ async def book_appointment(request: Request):
     if not claim.data:
         return tool_result(call_id, "That slot was just taken. Please offer the caller alternative times.")
 
+    # Upsert contact (dedupe by phone)
     existing = supabase.table("contacts").select("id").eq("phone", phone).execute()
     if existing.data:
         contact_id = existing.data[0]["id"]
@@ -163,6 +171,7 @@ async def book_appointment(request: Request):
         }).execute()
         contact_id = new_contact.data[0]["id"]
 
+    # Insert booking
     supabase.table("bookings").insert({
         "contact_id": contact_id,
         "slot_id": slot_id,
