@@ -20,11 +20,29 @@ BUSINESS_TZ = ZoneInfo("Asia/Karachi")
 # Shared helper: verify Retell's signature, return parsed body (or None, None)
 # ---------------------------------------------------------------------------
 async def verify_and_parse(request: Request):
+    """Verify Retell's signature against the RAW body (not re-parsed JSON —
+    re-serializing can reorder keys and break the signature check).
+
+    IMPORTANT: request.headers.get("X-Retell-Signature") returns None when the
+    header is missing entirely (e.g. a manual curl test, or any request that
+    didn't come from Retell). The Retell SDK's verify() does NOT guard against
+    this — it runs signature straight into a regex match and raises a raw
+    TypeError if signature is None, instead of returning False. That crash
+    was showing up as a 500 error on the exact "expected 401" test in the
+    deploy-verification checklist. We check for a missing header ourselves,
+    before ever calling verify(), so "no signature" and "bad signature" both
+    cleanly resolve to "unauthorized" instead of one of them crashing the app.
+    """
     raw_body = (await request.body()).decode("utf-8")
+    signature = request.headers.get("X-Retell-Signature")
+
+    if not signature:
+        return None, None
+
     valid = retell.verify(
         raw_body,
         api_key=os.environ["RETELL_API_KEY"],
-        signature=request.headers.get("X-Retell-Signature"),
+        signature=signature,
     )
     if not valid:
         return None, None
@@ -33,7 +51,8 @@ async def verify_and_parse(request: Request):
 
 @app.get("/")
 async def health_check():
-    # Simple endpoint to confirm the deploy is alive — hit this first after every deploy.
+    # Hit this first after every deploy — confirms the service is actually up
+    # before you spend time debugging anything downstream.
     return {"status": "ok"}
 
 
