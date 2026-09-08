@@ -1,4 +1,5 @@
 import os
+import json
 import hmac
 import uuid
 from datetime import datetime, time
@@ -12,19 +13,10 @@ from db import supabase
 app = FastAPI()
 
 VAPI_SERVER_SECRET = os.environ["VAPI_SERVER_SECRET"]
-
-# Match whatever timezone your Supabase seed data was built in.
 BUSINESS_TZ = ZoneInfo("Asia/Karachi")
 
 
 def verify_secret(request: Request) -> bool:
-    """Vapi sends back whatever secret you configured on each Tool's Server URL,
-    in the X-Vapi-Secret header, on every request to that tool. This is a plain
-    shared-secret check, not a cryptographic signature like Retell's — so there's
-    no regex/library call here that can crash on a missing header the way
-    Retell's SDK did. We still check for a missing header explicitly and fail
-    closed (return False) rather than relying on that being safe by accident.
-    hmac.compare_digest is used instead of `==` for a timing-safe comparison."""
     received = request.headers.get("X-Vapi-Secret")
     if not received:
         return False
@@ -32,41 +24,28 @@ def verify_secret(request: Request) -> bool:
 
 
 def log_payload(endpoint: str, body: dict):
-    """Temporary debug logging — prints the raw request body to Railway's logs
-    so you can confirm the actual shape Vapi sends for EACH tool (book_appointment
-    and escalate haven't been verified live yet, only check_availability has).
-    Tagged with the endpoint name so the three tools don't get mixed up in the
-    log stream. Remove this once all three tools are confirmed working end-to-end
-    — it logs caller PII (name/phone/email) to Railway's logs, which you don't
-    want lingering in production."""
     print(f"RAW VAPI PAYLOAD [{endpoint}]:", body)
 
 
 def get_tool_call(body: dict):
-    """Pull the arguments out of the request body.
-
-    CONFIRMED FROM PRODUCTION LOGS (Sept 2026): this Vapi account's Custom
-    Tool sends a FLAT body — just the arguments dict, e.g. {"date": "2024-09-10"}
-    — with no {"message": {"type": "tool-calls", ...}} envelope and no
-    toolCallId anywhere in the body. This differs from Vapi's documented
-    Function-tool webhook shape (and from Retell's), so we treat the whole
-    body as the arguments and correlate by the HTTP request/response pair
-    itself rather than by an echoed id.
-
-    We still check for the older enveloped shape first, in case Vapi changes
-    this or a different tool/account sends it — so this keeps working either
-    way instead of silently breaking again."""
+    """Extract tool call ID and arguments from either enveloped or flat payload."""
     message = body.get("message")
     if isinstance(message, dict) and message.get("type") == "tool-calls":
         tool_calls = message.get("toolCallList", [])
         if not tool_calls:
             return None, None
         call = tool_calls[0]
-        args = call.get("arguments", call.get("parameters", {}))
+        raw_args = call.get("arguments", call.get("parameters", {}))
+        # BUG FIX: arguments is often a JSON string, not a dict
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args)
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+        else:
+            args = raw_args if isinstance(raw_args, dict) else {}
         return call.get("id"), args
 
-    # Flat shape: the body itself IS the arguments. No id to extract, so
-    # return a sentinel so downstream code knows we're in flat mode.
     if isinstance(body, dict):
         return "flat", body
 
@@ -74,20 +53,12 @@ def get_tool_call(body: dict):
 
 
 def tool_result(tool_call_id, result_text: str):
-    """Shape the response to match whichever request shape we received.
-    Flat requests (the common case in production, per the logs) get a flat
-    response back — Vapi reads the result directly, no toolCallId needed.
-    Enveloped requests get the documented {"results": [...]} shape."""
     if tool_call_id == "flat":
         return {"result": result_text}
     return {"results": [{"toolCallId": tool_call_id, "result": result_text}]}
 
 
 def get_call_id(body: dict):
-    """The phone call's own id, used to tie bookings/escalations back to a
-    call in Supabase. Only present in the enveloped shape — flat requests
-    carry no call id at all, so we fall back to None (call_id is nullable
-    in the bookings/call_logs schema)."""
     message = body.get("message")
     if isinstance(message, dict):
         call = message.get("call", {})
@@ -97,8 +68,6 @@ def get_call_id(body: dict):
 
 @app.get("/")
 async def health_check():
-    # Hit this first after every deploy — confirms the service is actually up
-    # before you spend time debugging anything downstream.
     return {"status": "ok"}
 
 
@@ -114,13 +83,10 @@ async def check_availability(request: Request):
     if call_id is None:
         return JSONResponse(status_code=400, content={"message": "Not a tool-calls request"})
 
-    date_filter = args.get("date")  # e.g. "2026-09-10", meant as a LOCAL calendar date
+    date_filter = args.get("date")
 
     query = supabase.table("availability").select("*").eq("is_booked", False)
     if date_filter:
-        # Build local-day boundaries in BUSINESS_TZ, then convert to UTC for the query —
-        # a "day" in Lahore doesn't line up with a UTC day, so filtering on raw date
-        # strings against UTC timestamps silently returns the wrong slots near day edges.
         try:
             local_date = datetime.strptime(date_filter, "%Y-%m-%d").date()
         except ValueError:
@@ -136,15 +102,19 @@ async def check_availability(request: Request):
     if not slots:
         return tool_result(call_id, "No available slots found for that date. Ask the caller for an alternative date.")
 
-    # Convert stored UTC timestamps back to local time and format as something speakable.
-    readable = []
+    # BUG FIX: Return both slot_id (UUID) and readable label
+    # The model MUST use slot_id for booking, not the label
+    slot_list = []
     for s in slots:
         utc_dt = datetime.fromisoformat(s["slot_start"])
         local_dt = utc_dt.astimezone(BUSINESS_TZ)
-        # %-I drops the leading zero on the hour; Linux/Mac only (fine on Render/Railway).
-        readable.append(local_dt.strftime("%A, %B %d at %-I:%M %p"))
+        label = local_dt.strftime("%A, %B %d at %-I:%M %p")
+        slot_list.append(f"ID: {s['id']} | Time: {label}")
 
-    return tool_result(call_id, f"Available slots: {'; '.join(readable)}")
+    result_text = "Available slots:\n" + "\n".join(slot_list)
+    result_text += "\n\nIMPORTANT: When booking, use the exact ID value (not the time string) as slot_id."
+    
+    return tool_result(call_id, result_text)
 
 
 # ---- 2. Book appointment (atomic, race-condition safe) ----
@@ -159,7 +129,7 @@ async def book_appointment(request: Request):
     if call_id is None:
         return JSONResponse(status_code=400, content={"message": "Not a tool-calls request"})
 
-    vapi_call_id = get_call_id(body)  # the actual phone call, if present; None in flat mode
+    vapi_call_id = get_call_id(body)
 
     slot_id = args.get("slot_id")
     full_name = args.get("full_name")
@@ -168,6 +138,12 @@ async def book_appointment(request: Request):
 
     if not slot_id or not full_name or not phone:
         return tool_result(call_id, "Missing required booking details. Ask the caller to repeat their name and phone number.")
+
+    # Validate slot_id looks like a UUID (basic sanity check)
+    try:
+        uuid.UUID(str(slot_id))
+    except ValueError:
+        return tool_result(call_id, "Invalid slot ID format. Please try booking again with the correct slot ID from the available times.")
 
     # Atomic claim — prevents double-booking, safe even if Vapi retries this call
     claim = supabase.table("availability") \
@@ -210,9 +186,6 @@ async def escalate(request: Request):
 
     vapi_call_id = get_call_id(body)
     if vapi_call_id is None:
-        # call_logs.call_id is NOT NULL + unique — flat-mode requests carry no
-        # real call id, so fabricate a placeholder rather than let the insert
-        # crash. This row just won't tie back to a real call in Supabase.
         vapi_call_id = f"unknown-{uuid.uuid4()}"
     reason = args.get("reason", "unspecified")
 
