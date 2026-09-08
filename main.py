@@ -35,13 +35,16 @@ def get_tool_call(body: dict):
     """
     message = body.get("message")
     if isinstance(message, dict) and message.get("type") == "tool-calls":
-        # FIX: Changed from "toolCallList" to "toolCalls" to match actual Vapi payload
         tool_calls = message.get("toolCalls", [])
         if not tool_calls:
             return None, None
+        
         call = tool_calls[0]
-        raw_args = call.get("arguments", call.get("parameters", {}))
-
+        
+        # CRITICAL FIX: arguments are nested inside the 'function' key!
+        func = call.get("function", {})
+        raw_args = func.get("arguments", call.get("parameters", {}))
+        
         # Vapi often sends arguments as a JSON string, not a dict
         if isinstance(raw_args, str):
             try:
@@ -50,7 +53,7 @@ def get_tool_call(body: dict):
                 args = {}
         else:
             args = raw_args if isinstance(raw_args, dict) else {}
-
+        
         return call.get("id"), args
 
     # Fallback: flat shape (the body itself IS the arguments)
