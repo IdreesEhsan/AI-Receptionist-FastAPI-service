@@ -1,5 +1,6 @@
 import os
 import hmac
+import uuid
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
@@ -31,23 +32,56 @@ def verify_secret(request: Request) -> bool:
 
 
 def get_tool_call(body: dict):
-    """Pull the id and arguments out of Vapi's message.toolCallList[0].
-    Returns (None, None) if the payload doesn't look like a tool-calls message
-    at all — defensive, in case Vapi ever pings this URL with a different
-    event type by mistake."""
-    message = body.get("message", {})
-    if message.get("type") != "tool-calls":
-        return None, None
-    tool_calls = message.get("toolCallList", [])
-    if not tool_calls:
-        return None, None
-    call = tool_calls[0]
-    args = call.get("arguments", call.get("parameters", {}))
-    return call.get("id"), args
+    """Pull the arguments out of the request body.
+
+    CONFIRMED FROM PRODUCTION LOGS (Sept 2026): this Vapi account's Custom
+    Tool sends a FLAT body — just the arguments dict, e.g. {"date": "2024-09-10"}
+    — with no {"message": {"type": "tool-calls", ...}} envelope and no
+    toolCallId anywhere in the body. This differs from Vapi's documented
+    Function-tool webhook shape (and from Retell's), so we treat the whole
+    body as the arguments and correlate by the HTTP request/response pair
+    itself rather than by an echoed id.
+
+    We still check for the older enveloped shape first, in case Vapi changes
+    this or a different tool/account sends it — so this keeps working either
+    way instead of silently breaking again."""
+    message = body.get("message")
+    if isinstance(message, dict) and message.get("type") == "tool-calls":
+        tool_calls = message.get("toolCallList", [])
+        if not tool_calls:
+            return None, None
+        call = tool_calls[0]
+        args = call.get("arguments", call.get("parameters", {}))
+        return call.get("id"), args
+
+    # Flat shape: the body itself IS the arguments. No id to extract, so
+    # return a sentinel so downstream code knows we're in flat mode.
+    if isinstance(body, dict):
+        return "flat", body
+
+    return None, None
 
 
-def tool_result(tool_call_id: str, result_text: str):
+def tool_result(tool_call_id, result_text: str):
+    """Shape the response to match whichever request shape we received.
+    Flat requests (the common case in production, per the logs) get a flat
+    response back — Vapi reads the result directly, no toolCallId needed.
+    Enveloped requests get the documented {"results": [...]} shape."""
+    if tool_call_id == "flat":
+        return {"result": result_text}
     return {"results": [{"toolCallId": tool_call_id, "result": result_text}]}
+
+
+def get_call_id(body: dict):
+    """The phone call's own id, used to tie bookings/escalations back to a
+    call in Supabase. Only present in the enveloped shape — flat requests
+    carry no call id at all, so we fall back to None (call_id is nullable
+    in the bookings/call_logs schema)."""
+    message = body.get("message")
+    if isinstance(message, dict):
+        call = message.get("call", {})
+        return call.get("id")
+    return None
 
 
 @app.get("/")
@@ -64,7 +98,6 @@ async def check_availability(request: Request):
         return JSONResponse(status_code=401, content={"message": "Unauthorized"})
 
     body = await request.json()
-    print("RAW VAPI PAYLOAD:", body)
     call_id, args = get_tool_call(body)
     if call_id is None:
         return JSONResponse(status_code=400, content={"message": "Not a tool-calls request"})
@@ -113,7 +146,7 @@ async def book_appointment(request: Request):
     if call_id is None:
         return JSONResponse(status_code=400, content={"message": "Not a tool-calls request"})
 
-    vapi_call_id = body["message"]["call"]["id"]  # the actual phone call, not the tool-call id
+    vapi_call_id = get_call_id(body)  # the actual phone call, if present; None in flat mode
 
     slot_id = args.get("slot_id")
     full_name = args.get("full_name")
@@ -161,7 +194,12 @@ async def escalate(request: Request):
     if call_id is None:
         return JSONResponse(status_code=400, content={"message": "Not a tool-calls request"})
 
-    vapi_call_id = body["message"]["call"]["id"]
+    vapi_call_id = get_call_id(body)
+    if vapi_call_id is None:
+        # call_logs.call_id is NOT NULL + unique — flat-mode requests carry no
+        # real call id, so fabricate a placeholder rather than let the insert
+        # crash. This row just won't tie back to a real call in Supabase.
+        vapi_call_id = f"unknown-{uuid.uuid4()}"
     reason = args.get("reason", "unspecified")
 
     supabase.table("call_logs").upsert({
