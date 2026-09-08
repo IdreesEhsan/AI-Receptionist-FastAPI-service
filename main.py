@@ -64,6 +64,7 @@ async def check_availability(request: Request):
         return JSONResponse(status_code=401, content={"message": "Unauthorized"})
 
     body = await request.json()
+    print("RAW VAPI PAYLOAD:", body)
     call_id, args = get_tool_call(body)
     if call_id is None:
         return JSONResponse(status_code=400, content={"message": "Not a tool-calls request"})
