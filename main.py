@@ -212,6 +212,26 @@ async def book_appointment(request: Request):
 
     service = get_calendar_service()
     
+    # ---- CRITICAL FIX: Check if the slot is still available ----
+    freebusy_body = {
+        "timeMin": start_dt.astimezone(ZoneInfo("UTC")).isoformat(),
+        "timeMax": end_dt.astimezone(ZoneInfo("UTC")).isoformat(),
+        "items": [{"id": GOOGLE_CALENDAR_ID}]
+    }
+    
+    try:
+        freebusy_result = service.freebusy().query(body=freebusy_body).execute()
+    except Exception as e:
+        print(f"FREE BUSY CHECK ERROR: {e}")
+        return tool_result(call_id, "I'm having trouble checking availability right now. Please try again later.")
+    
+    busy_times = freebusy_result['calendars'][GOOGLE_CALENDAR_ID].get('busy', [])
+    
+    if busy_times:
+        # The slot is now taken (someone else booked it in the milliseconds between check and book)
+        return tool_result(call_id, "That slot was just taken. Please offer the caller alternative times.")
+    # ---- END OF FIX ----
+    
     # Create the event in Google Calendar
     event = {
         'summary': f'Consultation: {full_name}',
@@ -236,7 +256,7 @@ async def book_appointment(request: Request):
         print(f"GCAL INSERT ERROR: {e}")
         return tool_result(call_id, "That slot was just taken. Please offer the caller alternative times.")
 
-    # Log to Supabase for history
+    # ---- Log to Supabase ----
     try:
         existing = supabase.table("contacts").select("id").eq("phone", phone).execute()
         if existing.data:
