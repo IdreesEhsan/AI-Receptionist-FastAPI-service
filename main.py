@@ -216,10 +216,22 @@ async def escalate(request: Request):
         vapi_call_id = f"unknown-{uuid.uuid4()}"
     reason = args.get("reason", "unspecified")
 
-    supabase.table("call_logs").upsert({
-        "call_id": vapi_call_id,
-        "outcome": "escalated",
-        "escalation_reason": reason
-    }).execute()
+    # BUG FIX: upsert() with no on_conflict matches against the table's PRIMARY
+    # KEY (id), not against call_id — so without this, a SECOND escalate() call
+    # on the same call_id tried to INSERT a new row instead of updating the
+    # existing one, and hit the `call_id text unique not null` constraint,
+    # raising an unhandled exception -> bare 500 back to Vapi. Explicitly
+    # matching on call_id makes repeat escalations update in place.
+    try:
+        supabase.table("call_logs").upsert(
+            {"call_id": vapi_call_id, "outcome": "escalated", "escalation_reason": reason},
+            on_conflict="call_id"
+        ).execute()
+    except Exception as e:
+        # Never let a DB failure here surface as a crash the caller is told
+        # nothing about — the assistant would otherwise confidently promise a
+        # callback that was never actually logged anywhere.
+        print(f"ESCALATE DB WRITE FAILED for call_id={vapi_call_id}: {e}")
+        return tool_result(call_id, "I've noted this needs a callback, though I'm having a technical issue logging it fully right now — please also mention this if you call back.")
 
     return tool_result(call_id, "Escalation logged. Offer the caller a callback.")
