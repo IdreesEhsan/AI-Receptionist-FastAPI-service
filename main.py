@@ -15,7 +15,6 @@ from db import supabase
 
 app = FastAPI()
 
-# ---- Environment Variables ----
 VAPI_SERVER_SECRET = os.environ["VAPI_SERVER_SECRET"]
 BUSINESS_TZ = ZoneInfo("Asia/Karachi")
 
@@ -23,7 +22,6 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 GOOGLE_CALENDAR_ID = os.environ["GOOGLE_CALENDAR_ID"]
 
 
-# ---- Helper: Google Calendar Client ----
 def get_calendar_service():
     creds_json = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     creds = service_account.Credentials.from_service_account_info(
@@ -33,7 +31,6 @@ def get_calendar_service():
     return build('calendar', 'v3', credentials=creds)
 
 
-# ---- Helper: Vapi Auth ----
 def verify_secret(request: Request) -> bool:
     received = request.headers.get("X-Vapi-Secret")
     if not received:
@@ -81,11 +78,26 @@ def get_call_id(body: dict):
     return None
 
 
-# ---- Helper: Core Booking Logic (Reused by book & change) ----
 def create_booking_internal(full_name: str, phone: str, email: str, slot_time: str, vapi_call_id: str = None):
-    """
-    Internal helper to create a booking in Google Calendar and Supabase.
-    Returns (event_id, result_message) or raises ValueError.
+    """Shared helper: create a booking in Google Calendar + Supabase, or raise ValueError.
+
+    ROLLBACK FIX (found via live Postman testing): the Calendar event insert
+    and the Supabase writes are two separate external calls with no shared
+    transaction between them. A real test call hit a transient
+    ConnectionTerminated error on the Supabase side AFTER the Calendar event
+    had already been created successfully -- leaving a real, bookable-looking
+    slot on the calendar with no corresponding row in Supabase at all. That
+    orphan is invisible to lookup_appointment and change_appointment (both
+    query Supabase, not Calendar), and the slot stays permanently blocked
+    with no way to manage it through this system.
+
+    The fix: if the Supabase writes fail for any reason, attempt to delete
+    the Calendar event that was just created, so a failure rolls back cleanly
+    instead of leaving a phantom booking. This can't be made fully atomic
+    (the rollback delete call could itself fail), but it converts "silent,
+    permanent orphan" into "logged, best-effort cleanup, with a clear error
+    message telling you exactly which event ID needs manual attention if the
+    rollback itself fails."
     """
     start_dt = datetime.fromisoformat(slot_time)
     end_dt = start_dt + timedelta(hours=1)
@@ -116,23 +128,35 @@ def create_booking_internal(full_name: str, phone: str, email: str, slot_time: s
     event_id = created_event.get('id')
     print(f"Google Calendar event created: {created_event.get('htmlLink')}")
 
-    existing = supabase.table("contacts").select("id").eq("phone", phone).execute()
-    if existing.data:
-        contact_id = existing.data[0]["id"]
-    else:
-        new_contact = supabase.table("contacts").insert({
-            "full_name": full_name, "phone": phone, "email": email
-        }).execute()
-        contact_id = new_contact.data[0]["id"]
+    # Everything from here on writes to Supabase. If ANY of it fails, roll
+    # back the Calendar event we just created rather than leaving an orphan.
+    try:
+        existing = supabase.table("contacts").select("id").eq("phone", phone).execute()
+        if existing.data:
+            contact_id = existing.data[0]["id"]
+        else:
+            new_contact = supabase.table("contacts").insert({
+                "full_name": full_name, "phone": phone, "email": email
+            }).execute()
+            contact_id = new_contact.data[0]["id"]
 
-    supabase.table("bookings").insert({
-        "contact_id": contact_id,
-        "call_id": vapi_call_id,
-        "status": "confirmed",
-        "slot_start": start_dt.isoformat(),
-        "slot_end": end_dt.isoformat(),
-        "google_event_id": event_id
-    }).execute()
+        supabase.table("bookings").insert({
+            "contact_id": contact_id,
+            "call_id": vapi_call_id,
+            "status": "confirmed",
+            "slot_start": start_dt.isoformat(),
+            "slot_end": end_dt.isoformat(),
+            "google_event_id": event_id
+        }).execute()
+
+    except Exception as e:
+        print(f"SUPABASE WRITE FAILED after Calendar event {event_id} was created — attempting rollback: {e}")
+        try:
+            service.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=event_id).execute()
+            print(f"Rollback succeeded: deleted orphaned Calendar event {event_id}")
+        except Exception as rollback_err:
+            print(f"ROLLBACK ALSO FAILED — event {event_id} is orphaned on the calendar and needs MANUAL deletion: {rollback_err}")
+        raise ValueError("I had trouble completing that booking. Please try again.")
 
     return event_id, f"Booking confirmed for {full_name}."
 
@@ -156,13 +180,14 @@ async def check_availability(request: Request):
 
     date_filter = args.get("date")
 
-    # Defensive patch: the model has been observed sending a 2024- year
-    # (training-cutoff default). FIX: use the actual current year
-    # dynamically — a hardcoded literal here would go wrong next year.
-    if date_filter and date_filter.startswith("2024-"):
-        current_year = datetime.now().year
-        date_filter = date_filter.replace("2024", str(current_year), 1)
-        print(f"YEAR CORRECTED: {date_filter}")
+    # Safety net: the model has been observed sending a wrong (e.g.
+    # training-cutoff default) year. FIX: compute the real current year
+    # dynamically rather than hardcoding one.
+    if date_filter and len(date_filter) >= 4 and date_filter[:4].isdigit():
+        actual_year = str(datetime.now().year)
+        if date_filter[:4] != actual_year and int(date_filter[:4]) < datetime.now().year:
+            date_filter = actual_year + date_filter[4:]
+            print(f"YEAR CORRECTED: {date_filter}")
 
     if not date_filter:
         return tool_result(call_id, "Please provide a specific date.")
@@ -211,15 +236,8 @@ async def check_availability(request: Request):
     if not available_slots:
         return tool_result(call_id, "No available slots found for that date. Ask the caller for an alternative date.")
 
-    # CRITICAL FIX: embed the machine-readable slot_time directly in the
-    # speakable result text, for BOTH request shapes. The earlier version
-    # only attached machine-readable slot data to the flat-body branch, but
-    # this project's confirmed real Vapi traffic is ENVELOPED — so on every
-    # real call, the model received only human-readable times with no ISO
-    # slot_time to pass into book_appointment/change_appointment. Same
-    # category of bug as the earlier missing-slot_id issue, recurring under
-    # a new field name. tool_result() is used uniformly so both shapes get
-    # complete information.
+    # Embed the machine-readable slot_time directly in the speakable result
+    # text, for BOTH request shapes (Bug #1 fix).
     lines = []
     for slot in available_slots:
         dt = datetime.fromisoformat(slot['start'])
@@ -308,13 +326,10 @@ async def lookup_appointment(request: Request):
     local_dt = start_dt.astimezone(BUSINESS_TZ)
     readable_time = local_dt.strftime("%A, %B %d at %-I:%M %p")
 
-    # Note: booking_data["id"] / google_event_id are intentionally NOT
-    # included — change_appointment re-looks-up the booking server-side by
-    # phone number, so nothing downstream needs the model to echo an ID back.
     return tool_result(call_id, f"Found booking for {readable_time}.")
 
 
-# ---- 4. CHANGE APPOINTMENT (create new first, then delete old — see fix note) ----
+# ---- 4. CHANGE APPOINTMENT (create new first, then delete old) ----
 @app.post("/change-appointment")
 async def change_appointment(request: Request):
     if not verify_secret(request):
@@ -356,14 +371,9 @@ async def change_appointment(request: Request):
     old_event_id = booking_data.get("google_event_id")
     old_booking_id = booking_data["id"]
 
-    # SAFETY FIX: create the NEW booking FIRST. If this fails (slot taken,
-    # past date, Calendar API error), the caller's ORIGINAL booking is left
-    # completely untouched — nothing is deleted until the replacement is
-    # confirmed to exist. The prior ordering deleted old-then-created-new,
-    # which meant any failure during creation left the caller with NO
-    # appointment at all. This reordering trades a brief window where, if
-    # the process crashed between the two steps, both could technically
-    # coexist — a far better failure mode than losing the booking entirely.
+    # Create the NEW booking FIRST (this now includes its own Calendar/Supabase
+    # rollback via create_booking_internal), only delete the old one after the
+    # new one is confirmed to exist.
     vapi_call_id = get_call_id(body) or f"change-{uuid.uuid4()}"
     try:
         new_event_id, result_msg = create_booking_internal(full_name, phone, email, new_slot_time, vapi_call_id)
@@ -373,16 +383,12 @@ async def change_appointment(request: Request):
         print(f"CHANGE BOOKING ERROR (creating new slot): {e}")
         return tool_result(call_id, "I had trouble booking the new slot, so I've left your original appointment unchanged. Please try again.")
 
-    # Only now, with the new booking confirmed, remove the old one.
     service = get_calendar_service()
     if old_event_id:
         try:
             service.events().delete(calendarId=GOOGLE_CALENDAR_ID, eventId=old_event_id).execute()
             print(f"Deleted old event: {old_event_id}")
         except Exception as e:
-            # New booking already exists — caller DOES have a valid
-            # appointment, just a stale duplicate on the calendar. Log,
-            # don't fail: from the caller's perspective, this succeeded.
             print(f"WARNING: new booking created but failed to delete OLD Calendar event {old_event_id}: {e}")
 
     try:
